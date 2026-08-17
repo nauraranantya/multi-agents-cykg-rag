@@ -2,7 +2,7 @@
 from pydantic import BaseModel, Field
 from typing import List
 from langchain_core.prompts import ChatPromptTemplate
-from src.config.settings import llm, NEO4J_SCHEMA_ESCAPED_FOR_PROMPT
+from src.config.settings import llm
 
 class RephrasedQuestion(BaseModel):
     rephrased_question: str = Field(description="A rephrased, more specific version of the original question to improve answer generation.")
@@ -27,15 +27,15 @@ vector_reflection_chain = vector_reflection_prompt | llm.with_structured_output(
 # --- Cypher Reflection ---
 cypher_reflection_prompt = ChatPromptTemplate.from_messages([
     (
-        "system", 
-        f"""
+        "system",
+        """
         You are a query correction expert. A Cypher query returned no results.
         Your task is to rephrase the user's question to be more specific and likely to succeed with the given Neo4j graph schema.
         Analyze the failed query and the schema. For example, if the question was too broad, make it more specific. If it used terms not in the schema, suggest alternatives.
         Do not just repeat the question. Provide a meaningful improvement.
-        
+
         Schema:
-        {NEO4J_SCHEMA_ESCAPED_FOR_PROMPT}
+        {schema}
         """
     ),
     (

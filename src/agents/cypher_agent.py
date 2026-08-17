@@ -1,8 +1,10 @@
 # src/agents/cypher_agent.py
+from typing import Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_neo4j.chains.graph_qa.cypher import GraphCypherQAChain
 from langchain_openai import ChatOpenAI
 from src.config.settings import graph
+from src.retrieval.temporal import weight_and_sort_records
 
 # --- Cypher Generation Prompt Template ---
 cypher_generation_template = """
@@ -89,29 +91,51 @@ qa_generation_prompt = PromptTemplate(
 )
 
 # --- Cypher QA Chain and Query Function ---
-cypher_qa_chain = GraphCypherQAChain.from_llm(
-    top_k=10,
-    graph=graph,
-    verbose=True,
-    validate_cypher=True,
-    return_intermediate_steps=True,
-    cypher_prompt=cyper_generation_prompt,
-    qa_prompt=qa_generation_prompt,
-    qa_llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
-    cypher_llm=ChatOpenAI(model="gpt-4o", temperature=0),
-    allow_dangerous_requests=True,
-    use_function_response=True
-)
+# Built lazily (not at import time): GraphCypherQAChain.from_llm() eagerly
+# calls graph.get_structured_schema, which -- now that `graph` is a lazy
+# Neo4j proxy (see src/config/settings.py) -- would otherwise force a live
+# Neo4j connection the instant this module is imported, even by code that
+# never calls query_cypher() at all.
+_cypher_qa_chain = None
 
-def query_cypher(question: str) -> dict:
+
+def _get_cypher_qa_chain() -> GraphCypherQAChain:
+    global _cypher_qa_chain
+    if _cypher_qa_chain is None:
+        _cypher_qa_chain = GraphCypherQAChain.from_llm(
+            top_k=10,
+            graph=graph.resolve(),
+            verbose=True,
+            validate_cypher=True,
+            return_intermediate_steps=True,
+            cypher_prompt=cyper_generation_prompt,
+            qa_prompt=qa_generation_prompt,
+            qa_llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+            cypher_llm=ChatOpenAI(model="gpt-4o", temperature=0),
+            allow_dangerous_requests=True,
+            use_function_response=True
+        )
+    return _cypher_qa_chain
+
+
+def query_cypher(question: str, query_timestamp: Optional[str] = None) -> dict:
     """
     Generate and run a Cypher query against the graph database.
     Use this for complex questions requiring structured data, aggregations, or specific graph traversals
     Returns the query and the result context.
+
+    `query_timestamp`, when given, re-ranks the result rows by recency
+    (src/retrieval/temporal.py) before they're returned -- the generated
+    Cypher's RETURN clause is LLM-controlled and not fixed-schema, so rows
+    are heuristically scanned for an ISO-8601 timestamp value rather than
+    assuming a specific column.
     """
     print(f"--- Executing Cypher Search for: {question} ---")
-    response = cypher_qa_chain.invoke({"query": question})
+    response = _get_cypher_qa_chain().invoke({"query": question})
+    context = response["intermediate_steps"][1]["context"]
+    if query_timestamp and isinstance(context, list):
+        context = weight_and_sort_records(context, query_timestamp)
     return {
         "query": response["intermediate_steps"][0]["query"],
-        "context": response["intermediate_steps"][1]["context"]
+        "context": context
     }

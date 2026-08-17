@@ -10,12 +10,39 @@ from typing import Any, Dict, List, Optional
 import os
 import argparse
 import json
+import socket
 import sys
 import time
 import tiktoken
 import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+
+# rdflib's SPARQLConnector.query() calls urllib's urlopen() with no timeout
+# on any code path (verified directly in its source) -- a slow/stuck
+# endpoint (e.g. the w3id.org -> http://sepses.ifs.tuwien.ac.at redirect
+# chain measured taking 30s+ on some queries) hangs the request forever,
+# freezing the whole agent loop with no recovery (observed directly: an
+# 11+ minute hang on a single CallToolRequest). Passing timeout= to
+# SPARQLStore's constructor doesn't help -- it's never extracted from
+# self.kwargs and threaded through to urlopen(). Setting the process-wide
+# default socket timeout is the only lever that actually reaches these
+# calls; every socket operation in this process that doesn't set its own
+# timeout will raise socket.timeout after this many seconds instead of
+# blocking indefinitely.
+socket.setdefaulttimeout(30)
+
+# Some SPARQL endpoints (e.g. the public SEPSES endpoint at w3id.org) present
+# a certificate chain that isn't in every installed certifi snapshot, even
+# though it validates fine against the OS's own trust store (verified: curl
+# and macOS both accept it). truststore patches ssl to verify against the OS
+# trust store instead of certifi's bundled one -- must run before rdflib's
+# SPARQLStore (via urllib) opens any HTTPS connection.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 
 import rdflib
 from mcp.server.fastmcp import FastMCP, Context
@@ -119,24 +146,37 @@ async def attack_triplestore_lifespan(server: FastMCP, rdf_file: str, sparql_end
             except:
                 pass
 
+MAX_DESCRIPTION_CHARS = 400
+MAX_RESULT_CHARS = 6000  # ~1500 tokens -- keeps a single tool call's context contribution bounded
+
+
 def format_sparql_results(results, include_description: bool = False) -> str:
     """Format SPARQL query results into a readable string.
-    
+
+    Bounded on two axes, independent of whether the underlying SPARQL query
+    itself has a LIMIT (many of the ~40 tools don't): each `description`
+    field is truncated to MAX_DESCRIPTION_CHARS, and the total formatted
+    output is truncated to MAX_RESULT_CHARS (by whole result rows, never
+    mid-row) with a note about how many rows were omitted. Without this, a
+    broad keyword/tactic match can return dozens of full-paragraph
+    descriptions in one tool call, ballooning the agent's context and
+    latency for no benefit -- observed directly, not just a theoretical risk.
+
     Args:
         results: SPARQL query results
         include_description: Whether to include descriptions (if available)
-        
+
     Returns:
         Formatted string representation of the results
     """
     if not results:
         return "No results found."
-    
+
     formatted_results = []
-    
+
     for row in results:
         result_parts = []
-        
+
         # Handle different variable bindings
         for var_name, value in row.asdict().items():
             if value:
@@ -146,11 +186,27 @@ def format_sparql_results(results, include_description: bool = False) -> str:
                     local_name = str(value).split('#')[-1] if '#' in str(value) else str(value).split('/')[-1]
                     result_parts.append(f"{var_name}: {local_name}")
                 else:
-                    result_parts.append(f"{var_name}: {value}")
-        
+                    text = str(value)
+                    if var_name == "description" and len(text) > MAX_DESCRIPTION_CHARS:
+                        text = text[:MAX_DESCRIPTION_CHARS].rstrip() + "... [truncated]"
+                    result_parts.append(f"{var_name}: {text}")
+
         formatted_results.append(" | ".join(result_parts))
-    
-    return "\n".join(formatted_results)
+
+    output = "\n".join(formatted_results)
+    if len(output) > MAX_RESULT_CHARS:
+        kept, running = [], 0
+        for line in formatted_results:
+            if running + len(line) + 1 > MAX_RESULT_CHARS:
+                break
+            kept.append(line)
+            running += len(line) + 1
+        omitted = len(formatted_results) - len(kept)
+        output = "\n".join(kept) + (
+            f"\n... [{omitted} more result(s) truncated -- narrow your query "
+            f"(e.g. a more specific keyword/tactic, or include_description=False) to see more]"
+        )
+    return output
 
 #################################################################
 # Core Infrastructure Tools
@@ -363,6 +419,40 @@ def get_techniques_by_keyword(ctx: Context,  keyword: str, include_description: 
 
 
 @mcp.tool()
+def get_technique_by_id(technique_id: str, ctx: Context, include_description: bool = True) -> str:
+    """Get a specific MITRE ATT&CK technique or sub-technique by its ATT&CK ID.
+
+    Use this when the question references a technique by ID (e.g. "What is
+    T1505.003?") rather than by name -- get_techniques_by_keyword and the
+    other technique tools only match against the technique's title/description
+    text, not its ID, so an ID-only question returns no results there even
+    though the technique exists.
+
+    Args:
+        technique_id: ATT&CK technique ID, e.g. 'T1505.003' or 'T1110'
+        ctx: FastMCP context object
+        include_description: Whether to include descriptions (default: True)
+    """
+    normalized_id = technique_id.strip().upper()
+    query = f"""
+    PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
+    PREFIX dcterm: <http://purl.org/dc/terms/>
+
+    SELECT DISTINCT ?technique ?label ?description ?tacticLabel WHERE {{
+        ?technique a attack:Technique .
+        FILTER(STRENDS(STR(?technique), "/{normalized_id}"))
+        ?technique dcterm:title ?label .
+        OPTIONAL {{ ?technique dcterm:description ?description }}
+        OPTIONAL {{
+            ?technique attack:accomplishesTactic ?tactic .
+            ?tactic dcterm:title ?tacticLabel .
+        }}
+    }}
+    """
+    return execute_sparql_query(query, ctx, include_description)
+
+
+@mcp.tool()
 def get_techniques_by_tactic(tactic_name: str, ctx: Context, include_description: bool = False) -> str:
     """Get all techniques that accomplish a specific tactic.
     
@@ -421,19 +511,24 @@ def get_techniques_by_platform(platform: str, ctx: Context, include_description:
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
+    # ?platform is bound to a URI resource (e.g. .../attack/platform/Linux),
+    # not a string literal -- LCASE(?platform) directly errors on Virtuoso
+    # ("SL001: LCASE() needs a string value as 1st argument"). STR() first
+    # converts it to its string form (the platform name survives as the
+    # URI's last path segment, so CONTAINS still matches correctly).
     query = f"""
     PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
     PREFIX dcterm: <http://purl.org/dc/terms/>
-    
+
     SELECT ?technique ?label ?platform WHERE {{
         ?technique a attack:Technique .
         ?technique dcterm:title ?label .
         ?technique attack:platform ?platform .
-        FILTER(CONTAINS(LCASE(?platform), LCASE("{platform}")))
+        FILTER(CONTAINS(LCASE(STR(?platform)), LCASE("{platform}")))
     }}
     ORDER BY ?label
     """
-    
+
     return execute_sparql_query(query, ctx, include_description)
 
 #################################################################
@@ -706,11 +801,19 @@ def get_mitigations_for_technique(technique_name: str, ctx: Context, include_des
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
+    # The underlying CSKG has duplicate RDF triples and parallel canonical
+    # (T1078) / slug (valid-accounts) URIs for the same real technique or
+    # mitigation -- selecting the raw ?technique/?mitigation URIs multiplies
+    # those duplicates together in the join, producing dozens of rows that
+    # are semantically identical. The URIs aren't informative to read anyway
+    # (e.g. "course-of-action--f9f9e6ef-..."), so project + DISTINCT on just
+    # the human-readable labels instead, which collapses both duplication
+    # sources at once.
     query = f"""
     PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
     PREFIX dcterm: <http://purl.org/dc/terms/>
-    
-    SELECT ?technique ?techniqueLabel ?mitigation ?mitigationLabel WHERE {{
+
+    SELECT DISTINCT ?techniqueLabel ?mitigationLabel WHERE {{
         ?technique a attack:Technique .
         ?technique dcterm:title ?techniqueLabel .
         ?technique attack:hasMitigation ?mitigation .
@@ -719,7 +822,7 @@ def get_mitigations_for_technique(technique_name: str, ctx: Context, include_des
     }}
     ORDER BY ?mitigationLabel
     """
-    
+
     return execute_sparql_query(query, ctx, include_description)
 
 #################################################################

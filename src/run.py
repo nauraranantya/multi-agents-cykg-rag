@@ -3,6 +3,7 @@ import argparse
 import asyncio
 from src.utils.logging_config import setup_logging
 from src.graph.workflow import app
+from src.retrieval.temporal import now_iso
 import logging
 
 async def main():
@@ -21,6 +22,7 @@ async def main():
         "cypher_iteration_count": 1,
         "vector_iteration_count": 1,
         "max_iterations": 3,
+        "query_timestamp": now_iso(),
     }
 
     config = {"recursion_limit": 30}

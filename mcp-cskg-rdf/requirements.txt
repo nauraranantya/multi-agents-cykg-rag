@@ -3,3 +3,4 @@ rdflib[sparql]
 requests
 feedparser
 tiktoken
+truststore
