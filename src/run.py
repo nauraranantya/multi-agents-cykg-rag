@@ -19,9 +19,6 @@ async def main():
         "question": args.question,
         "original_question": args.question,
         "messages": [("human", args.question)],
-        "cypher_iteration_count": 1,
-        "vector_iteration_count": 1,
-        "max_iterations": 3,
         "query_timestamp": now_iso(),
     }
 

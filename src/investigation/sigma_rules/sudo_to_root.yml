@@ -1,0 +1,23 @@
+title: Successful Privilege Escalation via sudo to root
+id: ait-sudo-root-001
+status: experimental
+description: >
+  A process gained root privileges via sudo. Anchored on the exact phrasing
+  ("Successful sudo to ROOT executed") this repo's own
+  src/agents/alert_triage_agent.py module docstring already cites as a
+  genuinely suspicious example (contrasted there with the benign
+  "ClamAV database update").
+logsource:
+    category: process_creation
+    product: linux
+detection:
+    selection:
+        rule_description|contains:
+            - 'sudo to ROOT'
+            - 'USER=root'
+            - 'Successful sudo'
+    condition: selection
+level: medium
+tags:
+    - attack.t1548.003
+    - attack.privilege_escalation

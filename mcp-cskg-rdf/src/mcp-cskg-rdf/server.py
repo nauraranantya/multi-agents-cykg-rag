@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import os
 import argparse
 import json
+import re
 import socket
 import sys
 import time
@@ -17,6 +18,15 @@ import tiktoken
 import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+
+# This subprocess is launched (via browser_mcp.json) using the main
+# project's own .venv, so it normally inherits OPENAI_API_KEY from the
+# parent process's already-loaded environment (src/config/settings.py's
+# load_dotenv() runs before this subprocess is ever spawned). Loaded here
+# too, defensively, so this script also works standalone (e.g. run
+# directly for testing) without depending on that inheritance.
+from dotenv import load_dotenv
+load_dotenv()
 
 # rdflib's SPARQLConnector.query() calls urllib's urlopen() with no timeout
 # on any code path (verified directly in its source) -- a slow/stuck
@@ -45,6 +55,7 @@ except ImportError:
     pass
 
 import rdflib
+from openai import OpenAI
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.prompts import base
 
@@ -997,7 +1008,7 @@ async def get_all_data_sources(ctx: Context, include_description: bool = False) 
     ORDER BY ?label
     """
     
-    return format_sparql_results(query, ctx, include_description)
+    return execute_sparql_query(query, ctx, include_description)
 
 @mcp.tool()
 async def get_data_sources_by_keyword(ctx: Context, keyword:str, include_description: bool = False) -> str:
@@ -1021,7 +1032,7 @@ async def get_data_sources_by_keyword(ctx: Context, keyword:str, include_descrip
     ORDER BY ?label
     """
     
-    return format_sparql_results(query, ctx, include_description)
+    return execute_sparql_query(query, ctx, include_description)
 
 @mcp.tool()
 async def get_all_data_components(ctx: Context, include_description: bool = False) -> str:
@@ -1042,7 +1053,7 @@ async def get_all_data_components(ctx: Context, include_description: bool = Fals
     """
     
 
-    return format_sparql_results(query, ctx, include_description)
+    return execute_sparql_query(query, ctx, include_description)
 
 #################################################################
 # Complex Relationship Queries
@@ -1089,7 +1100,7 @@ async def get_technique_relationships(technique_name: str, ctx: Context, include
     }}
     ORDER BY ?relationshipType ?relatedLabel
     """
-    return format_sparql_results(query, ctx, include_description)
+    return execute_sparql_query(query, ctx, include_description)
 
 @mcp.tool()
 async def get_group_capabilities(group_name: str, ctx: Context, include_description: bool = False) -> str:
@@ -1125,40 +1136,7 @@ async def get_group_capabilities(group_name: str, ctx: Context, include_descript
     }}
     ORDER BY ?capabilityType ?capabilityLabel
     """
-    return format_sparql_results(query, ctx, include_description)
-
-#################################################################
-# Statistics and Summary Tools
-#################################################################
-
-@mcp.tool()
-async def get_attack_statistics() -> str:
-    """Get statistical summary of the MITRE ATT&CK knowledge base."""
-    
-    query = """
-    PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
-    
-    SELECT 
-        (COUNT(DISTINCT ?technique) AS ?techniqueCount)
-        (COUNT(DISTINCT ?subtechnique) AS ?subtechniqueCount)
-        (COUNT(DISTINCT ?group) AS ?groupCount)
-        (COUNT(DISTINCT ?software) AS ?softwareCount)
-        (COUNT(DISTINCT ?malware) AS ?malwareCount)
-        (COUNT(DISTINCT ?mitigation) AS ?mitigationCount)
-        (COUNT(DISTINCT ?tactic) AS ?tacticCount)
-        (COUNT(DISTINCT ?asset) AS ?assetCount)
-    WHERE {
-        OPTIONAL { ?technique a attack:Technique }
-        OPTIONAL { ?subtechnique a attack:SubTechnique }
-        OPTIONAL { ?group a attack:AdversaryGroup }
-        OPTIONAL { ?software a attack:Software }
-        OPTIONAL { ?malware a attack:Malware }
-        OPTIONAL { ?mitigation a attack:Mitigation }
-        OPTIONAL { ?tactic a attack:Tactic }
-        OPTIONAL { ?asset a attack:Asset }
-    }
-    """
-    return format_sparql_results(query)
+    return execute_sparql_query(query, ctx, include_description)
 
 #################################################################
 # CVE Query Tools
@@ -1427,6 +1405,162 @@ def get_cves_by_year(year: int, ctx: Context, include_description: bool = False)
     
     return execute_sparql_query(query, ctx, include_description)
 
+#################################################################
+# Free-form fallback: text -> SPARQL
+#################################################################
+# The ~40 tools above each answer one fixed, narrowly-scoped question
+# shape. This is the fallback for anything else the schema *can* answer
+# but no fixed tool covers -- schema-grounded LLM query generation, the
+# same approach src/agents/cypher_agent.py uses for Neo4j, adapted to this
+# server's RDF/SPARQL schema. (This replaces a previous implementation
+# that was broken two ways at once: registered with @mcp.prompt() instead
+# of @mcp.tool() -- a different MCP primitive an autonomous tool-calling
+# agent never sees in its tool list at all -- AND defined *after* this
+# module's `if __name__ == "__main__": mcp.run()` entry point, so even its
+# decorator never ran in the actual server process; it was never
+# registered as anything, let alone reachable. Its body was also a
+# hardcoded placeholder that ignored the input prompt entirely.)
+
+SPARQL_SCHEMA_DESCRIPTION = """
+Namespaces (always declare the ones you use as PREFIX lines):
+  attack: <http://w3id.org/sepses/vocab/ref/attack#>
+  cve:    <http://w3id.org/sepses/vocab/ref/cve#>
+  cvss:   <http://w3id.org/sepses/vocab/ref/cvss#>
+  capec:  <http://w3id.org/sepses/vocab/ref/capec#>
+  dcterm: <http://purl.org/dc/terms/>
+
+Classes: attack:Technique, attack:SubTechnique, attack:Tactic,
+  attack:AdversaryGroup, attack:Software, attack:Malware, attack:Mitigation,
+  cve:CVE
+
+Common triple patterns actually used by this knowledge base's own tools --
+follow these shapes exactly, don't invent alternate predicate names:
+  ?technique a attack:Technique ; dcterm:title ?label ;
+    dcterm:description ?desc ; attack:accomplishesTactic ?tactic .
+  ?subtechnique a attack:SubTechnique ; attack:isSubTechniqueOf ?parentTechnique .
+  ?tactic a attack:Tactic ; dcterm:title ?label .
+  ?group a attack:AdversaryGroup ; dcterm:title ?label ; attack:aliases ?aliases ;
+    attack:usesTechnique ?technique ; attack:usesSoftware ?software ;
+    attack:usesMalware ?malware .
+  ?mitigation a attack:Mitigation ; dcterm:title ?label ;
+    attack:preventsTechnique ?technique .
+    (equivalently, from the technique side: ?technique attack:hasMitigation ?mitigation)
+  ?software a attack:Software|attack:Malware ; dcterm:title ?label .
+  ?cve a cve:CVE ; dcterms:description ?desc ; dcterms:created ?published ;
+    dcterms:modified ?modified ; cve:hasCVSS3BaseMetric ?cvss3 .
+    ?cvss3 cvss:baseScore ?baseScore .
+
+Rules, matching this knowledge base's own conventions:
+  - Match technique/tactic/group/mitigation/software NAMES via
+    FILTER(CONTAINS(LCASE(?label), LCASE("..."))) on dcterm:title -- there is
+    no exact-match property.
+  - Match a technique by its ATT&CK ID (e.g. "T1110") via
+    FILTER(STRENDS(STR(?technique), "/T1110")) -- the ID is the URI's last
+    path segment, not a literal property value.
+  - ?baseScore is stored as a string; cast with xsd:integer(?baseScore)
+    before numeric comparison (declare PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>).
+  - Always SELECT human-readable ?label/?title variables alongside any URI
+    variable -- raw URIs are not useful to a downstream reader.
+  - This knowledge base has NO IP addresses, hostnames, domains, live
+    threat-intel feeds, or organization-specific data of any kind -- only
+    public MITRE ATT&CK (techniques/tactics/groups/software/mitigations)
+    and CVE/CVSS records. If the question needs any of that, it cannot be
+    answered from this schema at all.
+"""
+
+
+def _generate_sparql(question: str) -> Optional[str]:
+    """One-shot LLM call translating a natural-language question into a
+    single read-only SPARQL SELECT query grounded in the schema above.
+    Returns None if the model determines the question is outside what
+    this knowledge base can answer at all (e.g. IP reputation, live
+    threat feeds) -- forcing a query in that case would just waste a
+    round-trip returning nothing useful -- or if generation/the API key
+    itself fails."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        logger.error("[text_to_sparql] OPENAI_API_KEY not set -- cannot generate a query")
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You translate a natural-language question into a single read-only "
+                        "SPARQL SELECT query against the knowledge graph schema below. Output "
+                        "ONLY the raw SPARQL query text -- no markdown code fences, no "
+                        "explanation. If the question cannot be answered from this schema at "
+                        "all, output exactly the single word: NO_QUERY\n\n" + SPARQL_SCHEMA_DESCRIPTION
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error(f"[text_to_sparql] SPARQL generation call failed: {e}")
+        return None
+
+    if raw.upper().startswith("NO_QUERY"):
+        logger.info(f"[text_to_sparql] model determined this schema can't answer: {question!r}")
+        return None
+
+    # Defensive: strip markdown fences if the model adds them despite being
+    # told not to (observed behavior from structured-output-averse prompts
+    # elsewhere in this codebase's history).
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("sparql"):
+            raw = raw[len("sparql"):]
+    query = raw.strip()
+
+    # Same defense-in-depth posture as src/config/settings.py::
+    # ReadOnlyNeo4jGraph earlier in this project: reject any SPARQL Update
+    # keyword before the query ever reaches the endpoint. The public SEPSES
+    # endpoint only exposes a query (not update) protocol surface anyway,
+    # but a locally-configured --rdf-file/local-graph mode has no such
+    # protocol-level restriction, so this check is the only guard in that
+    # mode.
+    forbidden = re.compile(r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|COPY|MOVE|ADD)\b", re.IGNORECASE)
+    if forbidden.search(query):
+        logger.error(f"[text_to_sparql] generated query rejected (write keyword present): {query}")
+        return None
+    return query
+
+
+@mcp.tool()
+def text_to_sparql(prompt: str, ctx: Context, include_description: bool = False) -> str:
+    """Answer an open-ended question none of the other ~40 fixed tools
+    directly cover, by generating and executing a SPARQL query against the
+    MITRE ATT&CK / CVE / CVSS schema this server exposes. Check whether a
+    more specific tool already answers the question directly first (e.g.
+    get_technique_by_id for an ID lookup, get_cves_by_cvss_score for a
+    score range) -- those are cheaper and more reliable than a generated
+    query. This tool cannot answer questions needing data outside this
+    schema (IP reputation, live threat feeds, organization-specific data)
+    -- it will say so plainly rather than guessing.
+
+    Args:
+        prompt: The natural-language question to answer.
+        ctx: FastMCP context object.
+        include_description: Whether to include full description text in results (default: False).
+    """
+    query = _generate_sparql(prompt)
+    if query is None:
+        return (
+            "This question cannot be answered from this knowledge base -- it only covers "
+            "public MITRE ATT&CK (techniques, tactics, adversary groups, software, "
+            "mitigations) and CVE/CVSS data. It has no IP addresses, hostnames, live threat "
+            "feeds, or organization-specific data."
+        )
+    logger.info(f"[text_to_sparql] prompt={prompt!r} -> generated query:\n{query}")
+    return execute_sparql_query(query, ctx, include_description)
+
+
 # Run the server
 if __name__ == "__main__":
     logger.info("Starting mcp.run()")
@@ -1436,55 +1570,3 @@ if __name__ == "__main__":
         logger.error(f"Failed to start RDF Explorer: {str(e)}")
         sys.exit(1)
     logger.info("mcp.run() completed")
-
-@mcp.prompt()
-def text_to_sparql(prompt: str, ctx: Context) -> str:
-    """Convert a text prompt to a SPARQL query and execute it, with token limit checks.
-
-    Args:
-        prompt (str): The text prompt to convert to SPARQL.
-        ctx (Context): The FastMCP context object.
-
-    Returns:
-        str: Query results with usage stats, or an error message if execution fails or token limits are exceeded.
-    """
-    encoder = tiktoken.get_encoding("gpt2")
-    start_time = time.time()
-    grok_response = {"endpoint": None, "query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"}  # Placeholder
-    endpoint = grok_response.get("endpoint")
-    query = grok_response["query"]
-    logger.debug(f"Prompt received: {prompt}")
-    input_tokens = len(encoder.encode(prompt + query))
-    max_tokens = ctx.request_context.lifespan_context["max_tokens"]
-    if input_tokens > max_tokens:
-        logger.debug(f"Token limit exceeded: {input_tokens} > {max_tokens}")
-        return f"Error: Input exceeds token limit ({input_tokens} tokens > {max_tokens}). Shorten your prompt or increase MAX_TOKENS with 'set_max_tokens'."
-    active_endpoint = ctx.request_context.lifespan_context["active_external_endpoint"]
-    use_local = active_endpoint is None and endpoint is None
-    use_configured = active_endpoint and (endpoint is None or endpoint == active_endpoint)
-    use_extracted = endpoint and endpoint != active_endpoint
-    logger.debug(f"Execution context - Local: {use_local}, Configured: {use_configured}, Extracted: {use_extracted}")
-    try:
-        if use_extracted:
-            results = ctx.request_context.call_tool("execute_on_endpoint", {"endpoint": endpoint, "query": query})
-            logger.debug(f"Executed on extracted endpoint {endpoint}")
-        elif use_local:
-            results = ctx.request_context.call_tool("sparql_query", {"query": query, "use_service": False})
-            logger.debug("Executed on local graph")
-        elif use_configured:
-            results = ctx.request_context.call_tool("sparql_query", {"query": query})
-            logger.debug(f"Executed on configured endpoint {active_endpoint}")
-        else:
-            logger.debug("No valid execution context")
-            return "Unable to determine execution context for the query."
-        output_tokens = len(encoder.encode(results))
-        total_tokens = input_tokens + output_tokens
-        exec_time = time.time() - start_time
-        usage_stats = f"[Resource Usage: Input Tokens: {input_tokens}, Output Tokens: {output_tokens}, Total: {total_tokens}, Time: {exec_time:.2f}s]"
-        logger.debug(f"Usage stats generated: {usage_stats}")
-        return f"{results}\n\n{usage_stats}"
-    except Exception as e:
-        logger.error(f"Query execution error: {str(e)}")
-        if "interrupted" in str(e).lower():
-            return f"Error: Response interrupted, likely due to token limit (Input: {input_tokens} tokens, Max: {max_tokens}). Shorten input or increase MAX_TOKENS."
-        return f"Error executing query: {str(e)}"

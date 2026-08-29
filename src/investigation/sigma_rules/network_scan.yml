@@ -1,0 +1,18 @@
+title: Network/Port Scan Detected
+id: ait-network-scan-001
+status: experimental
+description: Reconnaissance activity -- a source probing multiple ports/services.
+logsource:
+    category: network
+    product: suricata
+detection:
+    selection:
+        rule_description|contains:
+            - 'ET SCAN'
+            - 'port scan'
+            - 'Nmap'
+    condition: selection
+level: medium
+tags:
+    - attack.t1046
+    - attack.discovery

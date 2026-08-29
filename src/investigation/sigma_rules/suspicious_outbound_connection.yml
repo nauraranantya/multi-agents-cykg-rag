@@ -1,0 +1,22 @@
+title: Suspicious Outbound Policy-Violation Connection
+id: ait-suspicious-outbound-001
+status: experimental
+description: >
+  A network IDS (Suricata/Snort ET POLICY category) flagged an outbound
+  connection as a policy violation -- a weak but real signal for
+  command-and-control or exfiltration traffic, worth surfacing even though
+  it's a single, non-conclusive indicator on its own.
+logsource:
+    category: network
+    product: suricata
+detection:
+    selection:
+        rule_description|contains:
+            - 'ET POLICY'
+            - 'Outbound'
+        rule_groups|contains: 'suricata'
+    condition: selection
+level: low
+tags:
+    - attack.t1071
+    - attack.command_and_control

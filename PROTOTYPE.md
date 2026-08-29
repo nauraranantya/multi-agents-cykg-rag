@@ -6,8 +6,9 @@ Status doc for the prototype built on top of the original AgCyRAG repo (see
 on (section references below point back to it). Plan file this was built
 from: `misty-soaring-goose` (4-phase roadmap + Phase 0 prerequisite fix).
 
-Last updated: 2026-08-17 (data pipeline consolidated onto AIT-ADS; retrieval
-timeout fix; LLM-as-a-Judge scoring added).
+Last updated: 2026-08-26 (Sigma-rule MITRE enrichment + attack-graph
+reconstruction added to §2.3a; security self-assessment against
+AgenticCyOps added -- see `SECURITY_ASSESSMENT.md`).
 
 ---
 
@@ -25,13 +26,16 @@ against real infrastructure (Neo4j AuraDB, OpenAI, the live SEPSES CSKG):
 | # | Addition | Fixes / addresses |
 |---|---|---|
 | 0 | Lazy Neo4j/LLM init | `settings.py` crashed at import with no credentials at all (analysis §3.2.6) |
-| 1 | Graph-construction + live stream + auto-trigger | No graph-construction code existed anywhere (analysis §3.2.5); trigger was manual-only (comparison table) |
+| 1 | Graph-construction + live stream | No graph-construction code existed anywhere (analysis §3.2.5); trigger was manual-only (comparison table). Originally paired with an auto-trigger gate -- superseded by #10 below, which decouples ingestion from investigation entirely |
 | 2 | Structured synthesizer output + grounding check | Synthesizer was free-text with no way to verify citations (analysis §3.1.4, §5.4) |
 | 3 | Temporal decay weighting on retrieval | AgCyRAG retrieval had no notion of recency at all |
 | 4 | Ground-truth-based quantitative eval (no reference answers) | AgCyRAG had zero quantitative evaluation (analysis §3.5.15); scores against the dataset's own structured labels instead of narrative similarity, so no human-authored reference answer is needed |
 | 5 | MCP RDF / CSKG live, bounded, and timeout-safe | `mcp-cskg-rdf` had no working config, an SSL trust gap, no result-size bounds, no ID-based technique lookup, and no timeout on its SPARQL calls (caused multi-minute hangs) |
 | 6 | Wall-clock timeout on retrieval retry loops | `cypher_agent`/`vector_agent` retry only bounded *how many* attempts happen, not how long any single attempt could take -- same failure class as #5, just not yet observed there |
 | 7 | LLM-as-a-Judge scoring (optional) | Structural ground-truth metrics (technique/escalation match) don't capture answer quality, faithfulness, or clarity -- added the validated rubric from Hamzić et al. 2604.11419v1 as a complementary scoring pass |
+| 8 | MITRE-tag signal | Raw `rule_level` alone is a near-useless trigger predictor on real data (§3.2) -- `rule_level >= threshold OR native MITRE tag`, verified to raise recall 4.6x at the same default threshold. Originally an auto-escalation gate; now reused by #10 as an urgency-ranking signal instead |
+| 9 | Non-blocking live ingestion | `trigger.py`'s live-stream loop writes each alert via `asyncio.to_thread` (the Neo4j driver call is synchronous) so a single ingest can't stall the event loop, even briefly |
+| 10 | Ingestion/investigation split | Ingestion (`src/ingestion/`) used to auto-invoke the pipeline inline per alert, with no human in the loop. Now two separate processes: ingestion only ever stores alerts into the graph; a human-invoked `src/investigation/` service clusters stored alerts into ranked "activity cases" (time-session + cross-host shared-indicator merging), and a checkpointed LangGraph thread turns a selected case into an initial investigation followed by a multi-turn chatroom with real conversational memory |
 
 ---
 
@@ -39,14 +43,24 @@ against real infrastructure (Neo4j AuraDB, OpenAI, the live SEPSES CSKG):
 
 ```mermaid
 flowchart TD
-    subgraph P1["src/ingestion/"]
+    subgraph P1["src/ingestion/ (process 1 -- ingest only)"]
         AA["ait_ads.py<br/>AIT-ADS scenario sample<br/>(Zenodo 8263181, downloaded separately)"] --> LS["live_stream.py<br/>async replay, paced"]
-        LS --> TR["trigger.py"]
+        LS --> TR["trigger.ingest_stream()<br/>never invokes the pipeline"]
     end
 
     TR -->|every alert, unconditional| GL["graph_loader.py<br/>raw alert -> Neo4j"]
     GL --> NEO[("Neo4j AuraDB<br/>Host/IP/User/Alert/MitreTechnique<br/>+ Chunk/Document + vector/fulltext indices")]
-    TR -->|rule_level >= threshold| APP[["app.ainvoke(...)"]]
+
+    subgraph P2["src/investigation/ (process 2 -- human-invoked)"]
+        CL["clustering.py<br/>fetch + time-session cluster +<br/>cross-host merge + urgency rank"]
+        NAR["narrative.py<br/>case_context fact sheet"]
+        SESS["session.py<br/>checkpointed_app (MemorySaver,<br/>thread_id = case_id)"]
+        CL --> NAR --> SESS
+        API["api.py (FastAPI)<br/>GET /cases, POST .../investigate,<br/>POST/GET .../chat"] --> CL
+        API --> SESS
+    end
+    NEO -.queried by.-> CL
+    SESS -->|turn 1: initial investigation,<br/>turn 2+: chatroom follow-up| APP[["checkpointed_app.ainvoke(...)"]]
 
     subgraph WF["AgCyRAG multi-agent pipeline -- src/graph/workflow.py"]
         GR["guardrails_agent"] --> VEC["vector_agent"]
@@ -70,13 +84,14 @@ flowchart TD
     CYP -.temporal re-rank.-> TW["src/retrieval/temporal.py<br/>DefenGraph eq.5 decay"]
     VEC -.temporal re-rank.-> TW
 
-    TR --> LOG[["data/auto_trigger_log.jsonl"]]
+    SESS --> ILOG[["data/investigations.jsonl<br/>(persistent audit trail)"]]
 
     subgraph EV["eval/"]
         RE["run_eval.py<br/>reads data/alerts.jsonl + alerts_ground_truth.json"] --> MET["metrics.py<br/>MITRE agreement, escalation P/R/F1,<br/>calibration, optional LLM-as-a-Judge"]
         ATT["analyze_trigger_threshold.py<br/>rule_level vs. ground truth, offline"]
     end
-    RE -.invokes app per alert.-> APP
+    RE -.invokes uncheckpointed app per alert, single-shot.-> RUNAPP[["src.run / eval: app.ainvoke(...)"]]
+    RUNAPP --> GR
 ```
 
 ### 2.1 Original AgCyRAG (unchanged logic, only touched for wiring)
@@ -115,8 +130,162 @@ exercised a Cypher call end-to-end).
 | `ait_ads.py` | Loads a sample from the [AIT Alert Data Set](https://zenodo.org/records/8263181) (real Wazuh/Suricata/AMiner alerts) -- writes `data/alerts.jsonl` + `data/alerts_ground_truth.json`. Ground truth is derived from labeled attack-phase time windows (`labels.csv`), not a per-alert field |
 | `graph_loader.py` | `ingest_alert()` / `load_all()` -- writes the structured entity graph **and** the Chunk/Document layer `vector_agent.py` expects (fulltext `entities` index, `vector`+`keyword` hybrid index) |
 | `live_stream.py` | `stream_alerts()` -- async generator replaying `alerts.jsonl` in timestamp order |
-| `trigger.py` | `handle_alert()` -- ingests every alert; auto-invokes `app.ainvoke(...)` only when `rule_level >= TRIGGER_SEVERITY_THRESHOLD` (default `7`). Logs to `data/auto_trigger_log.jsonl` |
+| `trigger.py` | `ingest_stream()` -- ingests every alert immediately (never blocks: uses `asyncio.to_thread` for the sync Neo4j write) and **only** ingests; no investigation is triggered here. `_trigger_reason()` (`rule_level >= TRIGGER_SEVERITY_THRESHOLD` OR native MITRE tag) is still computed per alert, purely for an informational print -- it's kept around as a standalone signal because `eval/` imports it directly for comparison, and `src/investigation/clustering.py` reuses it as one input to urgency ranking (§2.3a) |
 | `run_live.py` | CLI entrypoint wiring the two above |
+
+### 2.3a `src/investigation/` (process 2 -- human-invoked)
+
+The human-invoked replacement for the auto-trigger gate `trigger.py` used
+to have: ingestion (2.3) never invokes the pipeline anymore, so nothing
+does *unless* an analyst asks it to, via this package's FastAPI service
+(`uv run -m src.investigation.run_api`, a separate process from ingestion).
+
+| File | Role |
+|---|---|
+| `clustering.py` | `list_cases()`/`case_from_range()` -- fetches alerts from Neo4j (no persisted Case nodes; recomputed on demand every call) and clusters them into `Case`s: per-host time-session grouping (`CASE_SESSION_GAP_MINUTES`), then a Union-Find merge across hosts that share a source IP/dest user within `CASE_MERGE_GAP_MINUTES`. Every fetched alert is enriched with `sigma_matcher.py` matches before clustering. `score_urgency()` ranks cases 0-100 by reusing `_trigger_reason()` (noteworthy-alert count, now also true on a sigma-only match), max severity, case size, and `temporal.py`'s recency decay -- the same already-validated signals, just re-purposed from an auto-escalation gate into a ranking function |
+| `sigma_rules/*.yml` + `sigma_matcher.py` | A small (10-rule), hand-curated set of real Sigma-format detection rules -- see the module's docstring for why public SigmaHQ rules don't transfer here (they target raw per-platform log fields our alert-level schema doesn't have) -- matched against `rule_description`/`full_log`/`decoder_name`/`rule_groups`/`agent_name` at investigation time (not ingestion, so rule changes apply retroactively without a re-ingest). Produces `Alert.sigma_mitre_id`/`sigma_matched_rules`, a second MITRE signal alongside the sensor's native `rule_mitre_id` (native tags cover only ~36% of AIT-ADS alerts). Supports a practical subset of Sigma's condition language (`and`/`or`/`and not`/`N of X*`), same scoping-down precedent KRYSTAL sets for its own Sigma-to-SPARQL translation |
+| `attack_graph.py` | `build_attack_graph()` -- turns a case's member alerts into nodes (alert/host/IP/user/MITRE technique) and edges mirroring `graph_loader.py`'s real relation names, plus a derived `PRECEDES` edge chaining alerts that share an entity, in time order. The alert-granularity analogue of KRYSTAL's backward/forward chaining over its much lower-level per-syscall provenance graph. `root_cause_alert_id` = the alert with the most transitively-reachable downstream successors, ties broken by earliest timestamp -- exposed via `GET /cases/{case_id}/attack-graph` |
+| `narrative.py` | `build_case_context()` -- renders a case + its member alerts into the static text fact sheet passed once into the pipeline as `state['case_context']`, now ordered by `attack_graph.py`'s reconstructed chain (falling back to severity ranking) with the likely root-cause alert called out explicitly, and native vs. sigma-matched MITRE tags labeled separately |
+| `session.py` | Compiles `src.graph.workflow`'s uncompiled `workflow` StateGraph a *second* time with a `MemorySaver` checkpointer (`src/run.py`/`eval/` keep using the original uncheckpointed `app`, untouched). `start_investigation()` runs turn 1 (a fixed investigative directive + `case_context`) on a thread keyed by `case_id`; idempotent -- re-opening an already-started case returns the existing first turn instead of re-running the pipeline. `ask_followup()` runs later turns on the same thread with the analyst's literal message; `case_context` isn't resent since LangGraph's checkpointer carries the non-reducer field forward automatically. Every turn is also appended to `data/investigations.jsonl` (state itself is in-process-only and doesn't survive a restart) |
+| `api.py` | FastAPI: `GET /cases`, `POST /cases/{case_id}/investigate`, `GET /cases/{case_id}/attack-graph`, `POST /investigations/time-range`, `POST/GET /investigations/{case_id}/chat`. Optional `INVESTIGATION_API_KEY`-gated (`X-API-Key` header) -- see `SECURITY_ASSESSMENT.md` |
+| `run_api.py` | CLI entrypoint (uvicorn) |
+
+Real conversational memory, not just message storage: `src/graph/state.py`'s
+`case_context` field and `src/graph/workflow.py`'s `_render_conversation_context()`
+thread the case fact sheet and prior turns into `guardrails_agent.py`,
+`question_generation_agent.py`, and `synthesizer_agent.py`'s prompts (as
+optional appended sections, same precedent as the existing `retry_note`
+block) -- so a follow-up like "which host was that?" is actually answered
+using what turn 1 already found, not re-derived as a context-free question.
+`synthesizer_agent.py::SynthesizedReport` also gained a `mitigation_suggestions`
+field, so an investigation's output is explicitly summary + diagnosis +
+mitigation, not just one `final_answer` blob.
+
+**Turn-efficiency routing**: guardrails skips its LLM call entirely on turn
+1 (`state['skip_guardrails']` -- the input is a fixed directive over an
+already-human-selected case, nothing to triage). On follow-up turns,
+guardrails additionally decides `investigation_mode` -- `full_hypothesis`
+(the default), `direct_question` (a narrow follow-up gets exactly one
+targeted question instead of 3-5), or `answer_from_context` (the evidence
+already gathered in a prior turn already answers this one, so
+question_generation/dispatch_retrieval/review_evidence all skip
+themselves and the synthesizer answers directly from
+`question_results`/`log_cypher_context`/`log_vector_context`/
+`mcp_rdf_context` -- plain, non-reducer state fields the checkpointer
+already carries forward unchanged when nothing overwrites them, which is
+what makes this a "cache" with no extra storage). Every node now also logs
+its own output (not just that it ran) for observability, and
+`TurnRecord.latency_seconds` records full per-turn wall-clock time.
+
+**Guaranteed mitigation grounding**: `mitigation_suggestions` was previously
+always free-generated by the synthesizer LLM from its own training
+knowledge -- never actually pulled from `get_mitigations_for_technique`
+(mcp-cskg-rdf/server.py), even when a real MITRE technique had already
+been identified. `question_generation_node` now appends a deterministic
+(non-LLM) cskg question asking for mitigations on every technique in
+`state['known_mitre_techniques']` whenever there's at least one -- seeded
+from the case's own native+sigma tags on turn 1
+(`session.py::start_investigation`), grown by `synthesize_node` with
+whatever `SynthesizedReport.mitre_techniques` each turn newly identifies,
+and falling back to the single alert's own native tag for src/run.py/
+eval/. Skipped (like all of question_generation_node) during
+`answer_from_context` turns. Known gap this doesn't close:
+`grounding_check.py` still doesn't verify `mitigation_suggestions` claims
+against retrieved context the way it does `cited_entities`/
+`mitre_techniques` -- a real CSKG-grounded mitigation lookup is now
+guaranteed to happen, but the synthesizer isn't yet held to actually using
+it over its own free generation.
+
+**Evidence accumulates across turns, windowed**: `question_results` (and
+`log_cypher_context`/`log_vector_context`/`mcp_rdf_context`/
+`generated_question_for_rdf`, now DERIVED fresh from it each turn rather
+than separately maintained) used to be wholesale REPLACED by every
+`full_hypothesis`/`direct_question` turn -- none of `AgentState`'s fields
+besides `messages` have a LangGraph reducer, so a node's return value
+overwrites rather than merges. That meant an `answer_from_context` turn
+could only ever see the most recent retrieval-performing turn's evidence,
+not anything found earlier in the conversation -- a turn 2 on an unrelated
+topic would silently erase turn 1's findings from what future turns could
+reuse. `dispatch_retrieval_node` now tags each result with its turn number
+and accumulates onto prior turns' `question_results` instead of replacing
+it, windowed to the most recent `EVIDENCE_WINDOW_TURNS` (env-overridable,
+default 5) turns so a long conversation's prompt sizes stay bounded.
+`review_evidence_node` was updated in lockstep -- it now only reviews
+entries missing a `review` (this turn's new questions), reusing prior
+turns' verdicts as-is rather than wastefully (and non-deterministically)
+re-reviewing them every turn. `_render_hypothesis_summary` tags each line
+with its turn number so a multi-turn summary stays legible.
+
+**Query-quality pointers**: a live run surfaced four distinct causes behind
+consistently empty/failed retrieval results, diagnosed via `tools_used` in
+the `[mcp_rdf_agent]` log line above and the raw Cypher error text -- fixed
+at the prompt level rather than papered over with more retries:
+- `question_generation_agent.py` now states explicitly what `cypher`
+  actually has data for (Host/IP/User/Alert/MitreTechnique correlation --
+  nothing about authorization, config/IDS-rule changes, or asset
+  ownership) and what `cskg` does/doesn't cover (technique/CVE reference
+  meaning, never IP/host-specific correlation) -- previously it generated
+  plausible SOC-analyst questions the schema simply has no data to answer,
+  which isn't a retrieval failure, it's an unanswerable question.
+- `mcp_rdf_agent.py`'s system prompt now explains that most cskg tools
+  (`get_mitigations_for_technique`, `get_techniques_by_tactic`, etc.)
+  match on technique/entity NAME text, not MITRE ID -- passing a bare ID
+  silently returns nothing every time, which is exactly what happened to
+  the guaranteed mitigation question above (`get_mitigations_for_technique`
+  called 3 times, once per ID, zero results each time). Both the general
+  system prompt and that specific guaranteed question now spell out the
+  correct sequence (resolve ID -> name via `get_technique_by_id` first, or
+  use `text_to_sparql` to filter by ID directly).
+- `cypher_agent.py` gained a rule for the specific Cypher syntax error
+  observed: a `RETURN`/`WITH` using `DISTINCT` or an aggregate drops every
+  variable not explicitly returned, so a later `ORDER BY` referencing an
+  earlier MATCH variable is invalid -- a common LLM-generated-Cypher
+  mistake, not caught by the existing 10 rules.
+- `cypher_agent.py` also gained an upfront "what data does this question
+  actually need" framing step, plus a rule specifically about
+  `MitreTechnique.tactic`: it's only ever one of the ~14 standard MITRE
+  tactic names (native-tagged alerts only, most don't have one) -- never a
+  hypothesis's own wording, so `WHERE toLower(m.tactic) CONTAINS
+  "scanning"` was guaranteed to return nothing regardless of whether
+  matching data existed. A specific technique should filter by `m.id`
+  (the structured identifier); an open-ended question should retrieve the
+  alert's own `title`/`full_log` broadly instead of guessing a keyword
+  filter -- added as a new example (#6) alongside the existing five,
+  showing the wrong pattern next to the right one.
+
+**Escalation triage removed**: `guardrails_agent.py` used to also decide
+`should_escalate` ("should this auto-triggered alert be investigated at
+all") -- vestigial once ingestion/investigation split into two processes:
+nothing auto-triggers the pipeline anymore, an analyst always invokes
+investigation deliberately, so there was nothing left to triage. Removed
+from `GuardrailsOutput`, `AgentState`, and `decide_after_guardrails`, which
+now routes purely on relevance. `alert_triage_agent.py` (a standalone
+classifier this decision used to be compared against, never wired into the
+live pipeline) and its sole consumer `eval/evaluate_alert_triage.py` were
+removed in the same pass. `eval/run_eval.py`'s escalation-confusion-matrix
+metric is unaffected in what it *reads* (still `synthesized_report.
+recommended_priority`), but every alert it scores now always reaches the
+synthesizer for a real judged priority, rather than some being
+short-circuited to a hardcoded "ignore" by the removed gate -- a
+behavioral change worth knowing about if comparing against pre-cleanup
+eval numbers.
+
+**Known limitation**: `case_id` is a hash of its exact member-alert set at
+clustering time. A still-growing activity cluster (new alerts keep landing
+on the same host/indicators after an analyst already opened it) hashes to
+a *different* case_id on the next `GET /cases`, surfacing as a "new" case
+rather than extending the same investigation thread. Accepted for v1 to
+keep clustering stateless -- no persisted Case identity to keep in sync
+with a live ingestion stream running as a separate process.
+
+**Security**: `SECURITY_ASSESSMENT.md` applies AgenticCyOps' (Mitra et al.
+2026) own coverage-matrix evaluation method to this codebase's own
+multi-agent/MCP/persistent-memory architecture. Two concrete fixes came out
+of that pass: `src/config/settings.py`'s `ReadOnlyNeo4jGraph` (a dedicated,
+separate Neo4j connection that rejects any write/schema-mutating clause
+before it reaches the database -- `cypher_agent.py`'s LLM-generated Cypher
+previously had no technical restriction, only a prompt instruction not to
+write/delete), and the `INVESTIGATION_API_KEY` gate on `api.py` above.
 
 ### 2.4 Structured output + grounding
 

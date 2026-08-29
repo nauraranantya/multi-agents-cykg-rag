@@ -1,0 +1,24 @@
+title: Successful Login With Valid Account
+id: ait-valid-account-login-001
+status: experimental
+description: >
+  A successful authentication event -- benign on its own, but relevant as a
+  Valid Accounts (T1078) data point when correlated with other case
+  activity (e.g. preceded by brute-force attempts on the same host, per
+  ait-ssh-bruteforce-001). Deliberately low severity: this rule exists to
+  make the technique tag available for correlation, not to flag the login
+  itself as suspicious.
+logsource:
+    category: authentication
+    product: linux
+detection:
+    selection:
+        rule_description|contains:
+            - 'authentication success'
+            - 'Accepted password'
+            - 'session opened'
+    condition: selection
+level: low
+tags:
+    - attack.t1078
+    - attack.persistence

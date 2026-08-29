@@ -1,0 +1,22 @@
+title: SSH/Authentication Brute Force Attempt
+id: ait-ssh-bruteforce-001
+status: experimental
+description: >
+  Repeated authentication failures indicative of a brute-force login
+  attempt. Complements native rule_mitre_id, which AIT-ADS only tags on
+  ~36% of alerts (see src/ingestion/trigger.py's _trigger_reason docstring).
+logsource:
+    category: authentication
+    product: linux
+detection:
+    selection:
+        rule_description|contains:
+            - 'authentication failure'
+            - 'authentication failed'
+            - 'Failed password'
+            - 'multiple authentication failures'
+    condition: selection
+level: medium
+tags:
+    - attack.t1110
+    - attack.credential_access

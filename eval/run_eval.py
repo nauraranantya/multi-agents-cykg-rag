@@ -141,10 +141,8 @@ async def run_one(record: dict, use_llm_judge: bool = False, gate_filter: bool =
         "question": question,
         "original_question": question,
         "messages": [("human", question)],
-        "cypher_iteration_count": 1,
-        "vector_iteration_count": 1,
-        "max_iterations": 3,
         "query_timestamp": alert.timestamp,
+        "alert": alert.model_dump(),
     }
 
     start = time.monotonic()

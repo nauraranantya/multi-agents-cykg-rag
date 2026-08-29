@@ -1,5 +1,6 @@
 # src/config/settings.py
 import os
+import re
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_neo4j import Neo4jGraph
@@ -7,6 +8,18 @@ from langchain_neo4j.vectorstores.neo4j_vector import Neo4jVector
 from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv()
+
+# Set before mcp_use is ever imported anywhere in this codebase (only
+# src/agents/mcp_rdf_agent.py imports it, but settings.py is imported by
+# every agent module first, so this always runs earlier). mcp_use's
+# MCPAgent constructs a Posthog+Scarf telemetry client on every
+# instantiation unless this is already "false" by then --
+# mcp_rdf_agent.py's own get_mcp_client() sets it too, but only right
+# before building the MCPClient in that one function; setting it here as
+# well means it's never a race against import order elsewhere. Only
+# `setdefault` -- an explicit MCP_USE_ANONYMIZED_TELEMETRY=true in .env is
+# still honored.
+os.environ.setdefault("MCP_USE_ANONYMIZED_TELEMETRY", "false")
 
 # --- Optional LangChain/LangSmith tracing env vars ---
 # Only forward these if actually set -- previously this did
@@ -75,14 +88,68 @@ def _build_llm() -> ChatOpenAI:
     return ChatOpenAI(temperature=0, model_name="gpt-4o", api_key=api_key)
 
 
-def _build_graph() -> Neo4jGraph:
+def _neo4j_conn_kwargs() -> dict:
     uri = os.environ.get("NEO4J_AURA")
     username = os.environ.get("NEO4J_AURA_USERNAME")
     password = os.environ.get("NEO4J_AURA_PASSWORD")
     database = os.environ.get("NEO4J_AURA_DATABASE") or "neo4j"
     if not (uri and username and password):
         raise RuntimeError("NEO4J_AURA / NEO4J_AURA_USERNAME / NEO4J_AURA_PASSWORD are not set")
-    return Neo4jGraph(url=uri, username=username, password=password, database=database)
+    return {"url": uri, "username": username, "password": password, "database": database}
+
+
+def _build_graph() -> Neo4jGraph:
+    # driver_config's connection_timeout bounds the *first* connection
+    # attempt specifically -- a paused free-tier Aura instance (auto-pauses
+    # after inactivity, per _LazyProxy's own docstring above) otherwise
+    # leaves the driver's default retry/backoff to decide how long to hang
+    # before giving up, which can look indistinguishable from a genuine
+    # deadlock. This makes that failure mode fail fast with a clear
+    # RuntimeError (via _LazyProxy._get's except clause) instead.
+    return Neo4jGraph(**_neo4j_conn_kwargs(), driver_config={"connection_timeout": 15})
+
+
+# Cypher/DDL clauses that mutate data or schema. Word-boundary matched,
+# case-insensitive; covers the standard write clauses plus the write-side
+# APOC procedure families (apoc.create.*, apoc.merge.*, apoc.periodic.*,
+# etc. -- APOC ships plenty of read-only procedures too, so this only
+# blocks `CALL apoc.<family>.` names that are themselves write-shaped).
+_WRITE_CYPHER_RE = re.compile(
+    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|"
+    r"CALL\s+apoc\.[a-zA-Z]+\.(create|merge|delete|remove|refactor|periodic|write))\b",
+    re.IGNORECASE,
+)
+
+
+class ReadOnlyNeo4jGraph(Neo4jGraph):
+    """Defense-in-depth for the one place in this codebase an LLM's own
+    generated Cypher gets executed against the live graph:
+    src/agents/cypher_agent.py's GraphCypherQAChain (built with
+    allow_dangerous_requests=True, per langchain_neo4j's own required
+    opt-in) calls self.graph.query(generated_cypher) with no execution-time
+    restriction of its own -- see langchain_neo4j/chains/graph_qa/cypher.py
+    _call(). The prompt there already says "do not run queries that would
+    add to or delete from the database", but that's a prompt-level ask,
+    not a technical control -- trivially bypassable by a bad generation or
+    a prompt-injected alert field (full_log/rule_description) flowing into
+    `question`. This is the real capability-scoping boundary (see
+    SECURITY_ASSESSMENT.md): reject any query containing a write/schema
+    clause before it ever reaches Neo4j. A *separate* connection object
+    from the shared `graph` below, which legitimately needs write access
+    for ingestion (src/ingestion/graph_loader.py) -- only
+    src/agents/cypher_agent.py should ever use this one."""
+
+    def query(self, query: str, params: dict = {}, session_params: dict = {}):
+        if _WRITE_CYPHER_RE.search(query):
+            raise ValueError(
+                f"Refusing to execute a write/schema-mutating Cypher query "
+                f"against the read-only connection: {query!r}"
+            )
+        return super().query(query, params=params, session_params=session_params)
+
+
+def _build_read_only_graph() -> ReadOnlyNeo4jGraph:
+    return ReadOnlyNeo4jGraph(**_neo4j_conn_kwargs(), driver_config={"connection_timeout": 15})
 
 
 _embeddings_cache: dict = {}
@@ -122,6 +189,9 @@ llm = _build_llm()
 # --- Neo4j graph + vector index (lazy: connects on first real use) ---
 graph = _LazyProxy(_build_graph, "Neo4j graph connection")
 vector_index = _LazyProxy(_build_vector_index, "Neo4j vector index")
+# Separate connection, separate singleton: see ReadOnlyNeo4jGraph's
+# docstring above -- only src/agents/cypher_agent.py should use this one.
+read_only_graph = _LazyProxy(_build_read_only_graph, "Neo4j graph connection (read-only)")
 
 _schema_cache: dict = {}
 

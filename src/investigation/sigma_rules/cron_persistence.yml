@@ -1,0 +1,18 @@
+title: Scheduled Task / Cron Job Creation (Persistence)
+id: ait-cron-persistence-001
+status: experimental
+description: A cron job or scheduled task was created -- a common persistence mechanism.
+logsource:
+    category: process_creation
+    product: linux
+detection:
+    selection:
+        full_log|contains:
+            - 'crontab'
+            - '/etc/cron'
+        rule_groups|contains: 'syscheck'
+    condition: selection
+level: medium
+tags:
+    - attack.t1053.003
+    - attack.persistence

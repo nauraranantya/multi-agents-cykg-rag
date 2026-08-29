@@ -21,4 +21,15 @@ def setup_logging():
         ]
     )
 
+    # Quiet third-party chatter that drowns out src/graph/workflow.py's
+    # per-agent output lines (each node logs under its own "agent.<name>"
+    # logger -- see workflow.py -- specifically so a reader can tell which
+    # agent said what; a "HTTP Request: POST ... 200 OK" line from httpx
+    # after every single LLM call, or a Neo4j "UnknownRelationshipType"
+    # notification for every alert missing an optional field, defeats that
+    # by burying the signal). Real errors from either still surface -- only
+    # their routine INFO/WARNING noise is silenced.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
 logger = logging.getLogger(__name__)

@@ -3,6 +3,15 @@
 `cited_entities`/`mitre_techniques` are read by src/agents/grounding_check.py
 to verify the report only references entities actually present in the
 retrieved context.
+
+Also now consumes `hypothesis_summary` (built from question_generation_agent's
+QuestionSet + review_agent's per-question verdicts, rendered in
+src/graph/workflow.py::_render_hypothesis_summary) -- a deterministic
+rollup of which candidate scenarios were confirmed/ruled out/left
+inconclusive. This absorbs log_analysis_agent.py's old summarization role
+(that module is dissolved -- its other job, deciding whether a CSKG lookup
+was needed, is now decided per-question by question_generation_agent's
+`source` tag instead of after the fact).
 """
 from typing import List, Literal
 from pydantic import BaseModel, Field
@@ -41,10 +50,18 @@ class SynthesizedReport(BaseModel):
         "benign/expected activity or there's no log/alert question to triage at all (e.g. a general "
         "cybersecurity-knowledge question)."
     )
+    mitigation_suggestions: List[str] = Field(
+        default_factory=list,
+        description="Concrete, actionable response/mitigation steps a SOC analyst could take given "
+        "final_answer -- e.g. specific accounts to disable, hosts to isolate, rules to tighten. Empty "
+        "if recommended_priority is 'ignore' or there's nothing actionable to suggest (e.g. a general "
+        "knowledge question)."
+    )
 
 
 synthesis_prompt = ChatPromptTemplate.from_template("""You are an expert cybersecurity analyst creating a final report.
-Your task is to synthesize information from a log analysis and a cybersecurity knowledge base to answer a user's question.
+Your task is to synthesize information gathered across several investigative questions -- each
+generated to confirm or rule out a specific hypothesis about this alert -- into one report.
 
 If a section's source has no data (e.g. no log data was queried), state "Not applicable for this query." for that field.
 
@@ -52,12 +69,31 @@ CRITICAL: only put entities (hostnames, IPs, usernames, MITRE technique IDs, etc
 or reference them in critical_analysis/final_answer if they literally appear in the context below. Do not invent
 or infer entities that are not present in the provided context.
 
+Use the hypothesis summary below as your primary reasoning scaffold: weigh which hypotheses were
+confirmed, ruled out, or left inconclusive, and let that drive critical_analysis and final_answer --
+don't just restate raw context. A hypothesis being ruled out is as informative as one being confirmed.
+
 Also set recommended_priority: 'escalate' for genuinely suspicious/malicious activity needing prompt human
 response, 'monitor' for activity worth tracking but not urgent, 'ignore' for benign/expected activity or
 questions that aren't about a specific alert at all (e.g. general cybersecurity knowledge questions).
+Populate mitigation_suggestions with concrete response actions when recommended_priority is 'monitor' or
+'escalate'; leave it empty otherwise.
+
+If "Conversation so far" below is not N/A, this is a follow-up question inside an ongoing investigation --
+final_answer should directly address the analyst's latest question in light of what was already found,
+not restate the whole case from scratch.
+
+**Case Context (static case fact sheet, if this belongs to a clustered investigation case):**
+{case_context}
+
+**Conversation So Far (prior turns in this investigation, if any):**
+{conversation_context}
 
 **Original Question:**
 {original_question}
+
+**Hypothesis Summary (generated questions + review verdicts):**
+{hypothesis_summary}
 
 **Cypher Log Information Context:**
 {log_cypher_context}

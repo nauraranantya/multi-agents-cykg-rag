@@ -25,6 +25,19 @@ class Alert(BaseModel):
     rule_mitre_id: List[str] = Field(default_factory=list)
     rule_mitre_tactic: List[str] = Field(default_factory=list)
 
+    # Populated only in-memory at investigation time
+    # (src/investigation/sigma_matcher.py, applied by clustering.py's alert
+    # fetch), never persisted to Neo4j -- a second, complementary MITRE
+    # signal alongside rule_mitre_id (native sensor tags cover only ~36% of
+    # AIT-ADS alerts; see src/ingestion/trigger.py's _trigger_reason
+    # docstring). Kept as a separate field rather than merged into
+    # rule_mitre_id so callers can still tell native vs. rule-matched apart.
+    sigma_mitre_id: List[str] = Field(default_factory=list)
+    # Titles of the src/investigation/sigma_rules/*.yml rules that produced
+    # sigma_mitre_id above, for transparency in case_context/API output --
+    # same in-memory-only scope as sigma_mitre_id.
+    sigma_matched_rules: List[str] = Field(default_factory=list)
+
     data_srcip: Optional[str] = None
     data_dstip: Optional[str] = None
     data_dstuser: Optional[str] = None

@@ -1,0 +1,18 @@
+title: Possible DNS Tunneling / Suspicious DNS Query
+id: ait-dns-tunneling-001
+status: experimental
+description: DNS-based command-and-control or exfiltration indicators flagged by IDS.
+logsource:
+    category: network
+    product: suricata
+detection:
+    selection:
+        rule_description|contains:
+            - 'ET DNS'
+            - 'DNS Tunneling'
+            - 'dns tunneling'
+    condition: selection
+level: medium
+tags:
+    - attack.t1071.004
+    - attack.command_and_control
