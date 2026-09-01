@@ -18,6 +18,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from src.ingestion.config import load_config
 from src.ingestion.live_stream import stream_alerts
 from src.ingestion.trigger import ingest_stream
 from src.utils.logging_config import setup_logging
@@ -27,15 +28,19 @@ logging.getLogger("mcp_use").propagate = False
 
 def main():
     setup_logging()
+    config = load_config()  # data/ingestion_config.json -- set via the investigation API's
+    # PUT /ingestion/config (e.g. from a UI), or left at defaults if never configured. CLI flags
+    # below always override it for a one-off run.
     parser = argparse.ArgumentParser(description="Replay synthetic alerts and ingest them into the graph.")
-    parser.add_argument("--alerts-path", type=Path, default=None,
-                         help="Path to the alerts JSONL to replay (default: data/alerts.jsonl). "
-                              "Point this at a smaller file -- e.g. a truncated sample -- to run "
-                              "a quick smoke test instead of the full set.")
-    parser.add_argument("--speed", type=float, default=100000.0,
+    parser.add_argument("--alerts-path", type=Path, default=config.alerts_path,
+                         help="Path to the alerts JSONL to replay (default: configured value, "
+                              "or data/alerts.jsonl if never configured). Point this at a smaller "
+                              "file -- e.g. a truncated sample -- to run a quick smoke test instead "
+                              "of the full set.")
+    parser.add_argument("--speed", type=float, default=config.speed,
                          help="Time compression factor (simulated seconds per real second). "
                               "Default replays the ~5-day synthetic window in well under a minute.")
-    parser.add_argument("--max-gap", type=float, default=0.2,
+    parser.add_argument("--max-gap", type=float, default=config.max_gap_seconds,
                          help="Max real seconds to sleep between alerts, regardless of --speed.")
     args = parser.parse_args()
 
